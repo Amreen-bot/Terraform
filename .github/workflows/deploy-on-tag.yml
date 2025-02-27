@@ -1,0 +1,140 @@
+name: Deploy on Tag Creation
+
+on:
+  create:
+    tags:
+      - 'CRQ*-*-*-*-release'  # Match the required pattern
+
+jobs:
+  validate_tag:
+    runs-on: ubuntu-latest
+    # Only run when a tag is created (not branches)
+    if: github.event.ref_type == 'tag'
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Fetch all history and tags
+      
+      - name: Validate Tag Format
+        id: tag-validation
+        run: |
+          # Get tag name from the event ref
+          TAG_NAME="${{ github.event.ref }}"
+          echo "Tag created: $TAG_NAME"
+          
+          # Validate tag format using regex
+          if ! [[ $TAG_NAME =~ ^CRQ[0-9]{5}-[a-zA-Z0-9_-]+-[0-9]{4}-[0-9]{2}-[0-9]{2}-release$ ]]; then
+            echo "ERROR: Tag format invalid!"
+            echo "Required format: CRQXXXXX-{apiname}-{date in format yyyy-MM-DD}-release"
+            echo "Example: CRQ12345-payment-api-2025-02-27-release"
+            exit 1
+          fi
+          
+          # Extract components for later use
+          CRQ_NUMBER=$(echo $TAG_NAME | cut -d'-' -f1)
+          API_NAME=$(echo $TAG_NAME | sed -E 's/CRQ[0-9]{5}-(.+)-[0-9]{4}-[0-9]{2}-[0-9]{2}-release/\1/')
+          RELEASE_DATE=$(echo $TAG_NAME | sed -E 's/CRQ[0-9]{5}-.+-([0-9]{4}-[0-9]{2}-[0-9]{2})-release/\1/')
+          
+          echo "CRQ Number: $CRQ_NUMBER"
+          echo "API Name: $API_NAME"
+          echo "Release Date: $RELEASE_DATE"
+          
+          # Set outputs for other jobs
+          echo "crq_number=$CRQ_NUMBER" >> $GITHUB_OUTPUT
+          echo "api_name=$API_NAME" >> $GITHUB_OUTPUT
+          echo "release_date=$RELEASE_DATE" >> $GITHUB_OUTPUT
+  
+  build:
+    needs: validate_tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Build application
+        run: npm run build
+      
+      - name: Run tests
+        run: npm test
+      
+      - name: Create build artifact
+        run: |
+          mkdir -p ./dist
+          npm run build
+          tar -czf build.tar.gz ./dist
+      
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-artifact
+          path: build.tar.gz
+  
+  deploy:
+    needs: [validate_tag, build]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Download build artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: build-artifact
+      
+      - name: Extract build artifact
+        run: tar -xzf build.tar.gz
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      
+      - name: Deploy to production
+        env:
+          CRQ_NUMBER: ${{ needs.validate_tag.outputs.crq_number }}
+          API_NAME: ${{ needs.validate_tag.outputs.api_name }}
+          RELEASE_DATE: ${{ needs.validate_tag.outputs.release_date }}
+          TAG_NAME: ${{ github.event.ref }}
+        run: |
+          echo "Deploying $API_NAME to production"
+          echo "CRQ: $CRQ_NUMBER"
+          echo "Release Date: $RELEASE_DATE"
+          echo "Tag: $TAG_NAME"
+          
+          # Example: Deploy to AWS Lambda
+          aws lambda update-function-code \
+            --function-name "$API_NAME-production" \
+            --zip-file fileb://dist/function.zip
+          
+          # Example: Update deployment record in DynamoDB
+          aws dynamodb put-item \
+            --table-name deployments \
+            --item '{
+              "apiName": {"S": "'"$API_NAME"'"},
+              "deploymentDate": {"S": "'"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"'"},
+              "crqNumber": {"S": "'"$CRQ_NUMBER"'"},
+              "tagName": {"S": "'"$TAG_NAME"'"}
+            }'
+          
+          # Example: Create release note in S3
+          echo "Release Notes for $API_NAME" > release-notes.txt
+          echo "Released on: $RELEASE_DATE" >> release-notes.txt
+          echo "CRQ: $CRQ_NUMBER" >> release-notes.txt
+          aws s3 cp release-notes.txt s3://my-company-releases/$API_NAME/$TAG_NAME/release-notes.txt
+      
+      - name: Notify deployment success
+        run: |
+          # Example: Send notification to Slack
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"✅ Successfully deployed ${{ needs.validate_tag.outputs.api_name }} to production with tag ${{ github.event.ref }}"}' \
+            ${{ secrets.SLACK_WEBHOOK_URL }}
